@@ -1,5 +1,6 @@
 """Pydantic schemas for products."""
-from pydantic import BaseModel
+import json
+from pydantic import BaseModel, field_validator
 from typing import Optional
 
 
@@ -25,3 +26,13 @@ class ProductOut(BaseModel):
     harvest_date: Optional[str]
     image_urls: list[str]
     department: str
+
+    @field_validator("image_urls", mode="before")
+    @classmethod
+    def parse_image_urls(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return v if isinstance(v, list) else []

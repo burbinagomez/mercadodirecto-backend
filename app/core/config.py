@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-prod"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://localhost:3001"
 
     # VelaFi payments (https://docs.velafi.com)
     velafi_base_url: str = "https://api-test.velafi.com"  # sandbox by default
