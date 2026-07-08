@@ -29,3 +29,14 @@ class OrderItem(Base):
     price: Mapped[float] = mapped_column(Float)
 
     order: Mapped["Order"] = relationship(back_populates="items")
+
+
+class CartItem(Base):
+    """Server-side cart line for a consumer (persisted across sessions)."""
+
+    __tablename__ = "cart_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    consumer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    qty: Mapped[int] = mapped_column(Integer, default=1)

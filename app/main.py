@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import Base, engine
 import app.models  # noqa: F401  (register models on Base.metadata)
-from app.routers import auth, farmers, consumers, products, cart, orders
+from app.routers import auth, farmers, consumers, products, cart, orders, payments
 
 Base.metadata.create_all(bind=engine)
 
@@ -25,6 +25,7 @@ app.include_router(consumers.router)
 app.include_router(products.router)
 app.include_router(cart.router)
 app.include_router(orders.router)
+app.include_router(payments.router)
 
 
 @app.get("/health", tags=["meta"])
