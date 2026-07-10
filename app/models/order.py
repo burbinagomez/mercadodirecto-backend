@@ -7,12 +7,26 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 
+class OrderStatus:
+    """Canonical order-state constants.
+
+    State machine (v1):
+      PENDING (reserved)  --> PAID (committed) --> ... (COLLECTED in future)
+         |
+         +--> CANCELLED (reservation released)
+    """
+    PENDING = "pending"
+    PAID = "paid"
+    CANCELLED = "cancelled"
+    PROCESSING = "processing"
+
+
 class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     consumer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    status: Mapped[str] = mapped_column(String(30), default="pending")
+    status: Mapped[str] = mapped_column(String(30), default=OrderStatus.PENDING)
     total: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), default=datetime.utcnow

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.order import Order, OrderItem
+from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.routers.auth import get_current_user
 from app.schemas.order import CheckoutRequest, OrderOut
@@ -20,17 +20,20 @@ def checkout(
     if current.role not in ("consumer", "restaurant"):
         raise HTTPException(status_code=403, detail="Only consumers and restaurants can order")
     total = 0.0
-    order = Order(consumer_id=current.id, status="pending", total=0.0)
+    order = Order(consumer_id=current.id, status=OrderStatus.PENDING, total=0.0)
     db.add(order)
     db.flush()
     for item in payload.items:
         product = db.get(Product, item.product_id)
-        if not product or product.quantity_available < item.qty:
+        if not product:
+            raise HTTPException(status_code=400, detail=f"Product not found: {item.product_id}")
+        unreserved = product.quantity_available - product.quantity_reserved
+        if unreserved < item.qty:
             raise HTTPException(status_code=400, detail=f"Unavailable: {item.product_id}")
         line = product.price_per_kg * item.qty
         total += line
         db.add(OrderItem(order_id=order.id, product_id=item.product_id, qty=item.qty, price=line))
-        product.quantity_available -= item.qty
+        product.quantity_reserved += item.qty
     order.total = total
     db.commit()
     db.refresh(order)
