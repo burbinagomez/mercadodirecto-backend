@@ -1,5 +1,7 @@
 """Payment records linking internal orders to VelaFi transactions."""
-from sqlalchemy import String, Float, Integer, ForeignKey, Text
+from datetime import datetime
+
+from sqlalchemy import String, Float, Integer, ForeignKey, Text, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,4 +20,6 @@ class Payment(Base):
     velafi_order_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
     velafi_payment_link: Mapped[str] = mapped_column(Text, nullable=True)
     reference: Mapped[str] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[str] = mapped_column(Text, default="now()")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=datetime.utcnow
+    )
