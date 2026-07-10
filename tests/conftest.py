@@ -21,7 +21,8 @@ from unittest.mock import patch
 from app.core.database import Base, get_db
 from app.core.security import create_access_token
 from app.main import app
-from app.models.payment import PaymentMethod, FarmerBankAccount
+from app.models.payment import PaymentMethod
+from app.models.payout import FarmerBankAccount
 from app.models.product import Product
 from app.models.user import User
 from app.services.velafi import VelaFiClient
@@ -175,7 +176,7 @@ def farmer(session) -> User:
 def farmer_bank_account(session, farmer) -> FarmerBankAccount:
     """A farmer bank account for payout tests."""
     acc = FarmerBankAccount(
-        farmer_id=farmer.id,
+        user_id=farmer.id,
         bank_name="Banco Agrario",
         account_number="1234567890",
         account_type="savings",

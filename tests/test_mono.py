@@ -19,7 +19,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.models.order import Order, OrderStatus
-from app.models.payment import Payment, PaymentMethod, FarmerBankAccount, FarmerPayout
+from app.models.payment import Payment, PaymentMethod
+from app.models.payout import FarmerBankAccount, FarmerPayout
 from app.models.product import Product
 from app.models.user import User
 

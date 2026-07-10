@@ -19,7 +19,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.order import Order, OrderItem, OrderStatus
-from app.models.payment import Payment, PaymentMethod, FarmerBankAccount, FarmerPayout
+from app.models.payment import Payment, PaymentMethod
+from app.models.payout import FarmerBankAccount, FarmerPayout
 from app.models.product import Product
 from app.routers.auth import get_current_user
 from app.services.base_client import PaymentProviderError
@@ -278,9 +279,11 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
     for farmer_id, amount in farmer_totals.items():
         bank_account = (
             db.query(FarmerBankAccount)
-            .filter(FarmerBankAccount.farmer_id == farmer_id)
+            .filter(FarmerBankAccount.user_id == farmer_id)
             .first()
         )
+        idempotency_key = f"payout-{order.id}-{farmer_id}"
+
         if not bank_account:
             logger.warning(
                 "Mono payout: no bank account for farmer %s order %s — skipping transfer",
@@ -292,11 +295,11 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
                 farmer_id=farmer_id,
                 amount=amount,
                 status="failed",
+                reference=idempotency_key,
             )
             db.add(payout)
             continue
 
-        idempotency_key = f"payout-{order.id}-{farmer_id}"
         try:
             transfer_result = mono_client.create_transfer(
                 dest_account=bank_account.account_number,
@@ -315,6 +318,7 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
                 farmer_bank_account_id=bank_account.id,
                 mono_transfer_id=transfer_id,
                 status="pending",
+                reference=idempotency_key,
             )
         except PaymentProviderError as exc:
             logger.error(
@@ -329,6 +333,7 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
                 amount=amount,
                 farmer_bank_account_id=bank_account.id,
                 status="failed",
+                reference=idempotency_key,
             )
 
         db.add(payout)
