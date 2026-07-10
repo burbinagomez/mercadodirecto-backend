@@ -267,15 +267,19 @@ def _apply_status_transition(
     pay_status: str,
     db: Session,
 ) -> dict[str, str]:
-    """Apply a valid status transition with terminal-state idempotency guard.
+    """Apply a valid status transition with idempotency guard.
 
-    Returns SUCCESS if the payment is already in a terminal state (no-op),
-    or after applying the transition. Returns FAIL if the order is missing.
+    Returns SUCCESS if the payment is already in the state this event
+    would set (duplicate retry), or after applying the transition.
+    Legitimate cross-status transitions (e.g. PAID -> CANCELLED refund)
+    are still allowed. Returns FAIL if the order is missing.
     """
-    # Idempotency guard: skip if Payment is already in a terminal state.
-    if payment.status in _TERMINAL_PAYMENT_STATUSES:
+    # Idempotency guard: skip if payment is already in the target state
+    # (duplicate retry).  Cross-status transitions like PAID -> CANCELLED
+    # are still allowed — the guard is per-state, not terminal-state.
+    if payment.status == pay_status:
         logger.info(
-            "Webhook: skipping event for terminal payment "
+            "Webhook: skipping duplicate event for payment "
             "payment_id=%s current_status=%s incoming_status=%s",
             payment.id,
             payment.status,
