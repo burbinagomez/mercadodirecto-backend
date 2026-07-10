@@ -1,4 +1,6 @@
 """Product listing endpoints."""
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -18,7 +20,9 @@ def create_product(
 ):
     if current.role != "farmer":
         raise HTTPException(status_code=403, detail="Only farmers can list products")
-    product = Product(farmer_id=current.id, **payload.model_dump())
+    data = payload.model_dump()
+    data["image_urls"] = json.dumps(data["image_urls"])
+    product = Product(farmer_id=current.id, **data)
     db.add(product)
     db.commit()
     db.refresh(product)

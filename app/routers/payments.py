@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.order import Order
 from app.models.payment import Payment
+from app.models.product import Product
 from app.routers.auth import get_current_user
 from app.services import velafi as velafi_svc
 
@@ -162,5 +163,11 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     order = db.get(Order, payment.order_id)
     if order:
         order.status = internal_status
+        # Release quantity back to available on cancellation
+        if internal_status == "cancelled":
+            for item in order.items:
+                product = db.get(Product, item.product_id)
+                if product:
+                    product.quantity_available += item.qty
     db.commit()
     return {"callbackStatus": "SUCCESS"}
