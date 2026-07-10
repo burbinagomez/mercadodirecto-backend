@@ -2,4 +2,4 @@
 from app.models.user import User, FarmerProfile, ConsumerProfile  # noqa: F401
 from app.models.product import Product  # noqa: F401
 from app.models.order import Order, OrderItem, CartItem  # noqa: F401
-from app.models.payment import Payment  # noqa: F401
+from app.models.payment import Payment, PaymentMethod, FarmerBankAccount, FarmerPayout  # noqa: F401

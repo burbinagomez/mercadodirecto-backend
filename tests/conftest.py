@@ -21,6 +21,7 @@ from unittest.mock import patch
 from app.core.database import Base, get_db
 from app.core.security import create_access_token
 from app.main import app
+from app.models.payment import PaymentMethod, FarmerBankAccount
 from app.models.product import Product
 from app.models.user import User
 from app.services.velafi import VelaFiClient
@@ -74,6 +75,12 @@ def session(engine) -> Generator[Session, Any, Any]:
     session.close()
     transaction.rollback()
     connection.close()
+
+
+@pytest.fixture()
+def db(session):
+    """Alias for ``session`` — matches test method parameter name."""
+    return session
 
 
 @pytest.fixture()
@@ -132,3 +139,48 @@ def sample_product(session) -> Product:
     session.add(p)
     session.flush()
     return p
+
+
+@pytest.fixture()
+def product(client: TestClient, farmer_token: str) -> dict[str, Any]:
+    """Create a product via the API and return its JSON dict."""
+    resp = client.post(
+        "/products",
+        json={
+            "name": "Test Tomato",
+            "category": "vegetables",
+            "price_per_kg": 2500.0,
+            "quantity_available": 100,
+            "department": "TestDept",
+        },
+        headers={"Authorization": f"Bearer {farmer_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+@pytest.fixture()
+def consumer(session) -> User:
+    """Return the existing consumer user created by consumer_token."""
+    return session.query(User).filter(User.role == "consumer").first()
+
+
+@pytest.fixture()
+def farmer(session) -> User:
+    """Return the existing farmer user created by farmer_token."""
+    return session.query(User).filter(User.role == "farmer").first()
+
+
+@pytest.fixture()
+def farmer_bank_account(session, farmer) -> FarmerBankAccount:
+    """A farmer bank account for payout tests."""
+    acc = FarmerBankAccount(
+        farmer_id=farmer.id,
+        bank_name="Banco Agrario",
+        account_number="1234567890",
+        account_type="savings",
+        verified=True,
+    )
+    session.add(acc)
+    session.flush()
+    return acc
