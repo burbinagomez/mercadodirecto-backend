@@ -1,11 +1,13 @@
-"""Payments endpoints — bridge internal orders to VelaFi.
+"""Payments endpoints — bridge internal orders to VelaFi or Mono.
 
 Flow:
-  POST /payments/checkout  -> takes an internal order id, calls VelaFi
-                              (fiat_to_fiat order OR stablecoin payment link),
-                              stores a Payment row, returns the link / orderId.
-  POST /payments/webhook   -> VelaFi pushes order status; verify RSA-SHA256
-                              signature, then update Payment + Order status.
+  POST /payments/checkout          -> takes an internal order id, calls VelaFi
+                                      (stablecoin) or Mono (PSE collection),
+                                      stores a Payment row, returns the
+                                      redirect link / order id.
+  POST /payments/webhook           -> VelaFi push (backward compat).
+  POST /payments/webhook/velafi    -> VelaFi push (canonical).
+  POST /payments/webhook/mono      -> Mono push (HMAC).
 """
 import logging
 
@@ -19,14 +21,17 @@ from app.models.order import Order, OrderItem, OrderStatus
 from app.models.payment import Payment
 from app.models.product import Product
 from app.routers.auth import get_current_user
+from app.services.mono import MonoClient
 from app.services import velafi as velafi_svc
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-# Terminal payment statuses — once reached, a Payment will not be updated again
-# by a retried webhook event.
+# Terminal payment statuses — once reached, a Payment is considered
+# final.  The idempotency guard below (``payment.status == pay_status``)
+# prevents duplicate events from re-processing while still allowing
+# legitimate cross-status transitions (e.g. PAID -> CANCELLED refund).
 _TERMINAL_PAYMENT_STATUSES = frozenset({"paid", "failed", "refunded"})
 
 
@@ -113,8 +118,67 @@ def checkout(
         raise HTTPException(status_code=502, detail=f"VelaFi: {e}")
 
 
-@router.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)):
+# ---------------------------------------------------------------------------
+# Shared state-transition logic for both VelaFi and Mono webhooks
+# ---------------------------------------------------------------------------
+def _apply_state_transition(
+    payment: Payment,
+    order: Order,
+    internal_status: str,
+    pay_status: str,
+    db: Session,
+) -> None:
+    """Apply the valid state transition, mutating *payment* and *order*
+    in-place.  Caller is responsible for ``db.commit()`` after this.
+
+    Raises nothing — if no transition matches the current state, the
+    function is a no-op (the webhook ack's SUCCESS either way).
+    """
+    prev_pay_status = payment.status
+    order_was_paid = order.status == OrderStatus.PAID
+    order_was_cancelled = order.status == OrderStatus.CANCELLED
+
+    # PENDING -> PAID: commit reservation
+    if (
+        internal_status == OrderStatus.PAID
+        and not order_was_paid
+        and not order_was_cancelled
+        and prev_pay_status != "paid"
+    ):
+        order.status = OrderStatus.PAID
+        payment.status = "paid"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                product.quantity_available -= oi.qty
+                product.quantity_reserved -= oi.qty
+
+    # PENDING/PAID -> CANCELLED: release reservation (or refund)
+    elif (
+        internal_status == OrderStatus.CANCELLED
+        and not order_was_cancelled
+        and prev_pay_status != "failed"
+    ):
+        order.status = OrderStatus.CANCELLED
+        payment.status = "failed"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                if order_was_paid:
+                    product.quantity_available += oi.qty
+                else:
+                    product.quantity_reserved -= oi.qty
+
+    # Intermediate processing status — no inventory side effect.
+    elif internal_status == OrderStatus.PROCESSING:
+        order.status = OrderStatus.PROCESSING
+        payment.status = "created"
+
+
+# ---------------------------------------------------------------------------
+# VelaFi webhook handler (shared by /webhook and /webhook/velafi)
+# ---------------------------------------------------------------------------
+async def _handle_velafi_webhook(request: Request, db: Session) -> dict[str, str]:
     raw = await request.body()
     signature = request.headers.get("signature", "")
     if not velafi_svc.VelaFiClient.verify_webhook(raw, signature):
@@ -126,7 +190,6 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
         )
         return {"callbackStatus": "FAIL"}
 
-    event = {}
     try:
         event = await request.json()
     except Exception:
@@ -138,73 +201,111 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     # Map VelaFi status -> internal
     if status_code in ("50", "60"):
         internal_status = OrderStatus.PAID
+        pay_status = "paid"
     elif status_code in ("70", "71", "72"):
         internal_status = OrderStatus.CANCELLED
+        pay_status = "failed"
     else:
         internal_status = OrderStatus.PROCESSING
+        pay_status = "created"
 
     payment = db.query(Payment).filter(Payment.velafi_order_id == velafi_order_id).first()
     if not payment:
         return {"callbackStatus": "SUCCESS"}
 
-    # Idempotency guard: skip if Payment is already in a terminal state.
-    if payment.status in _TERMINAL_PAYMENT_STATUSES:
+    # Idempotency guard: skip if payment is already in the state this
+    # event would set (duplicate retry).  Legitimate cross-status
+    # transitions (e.g. PAID -> CANCELLED refund) are still allowed.
+    if payment.status == pay_status:
         logger.info(
-            "VelaFi webhook: skipping event for terminal payment "
-            "payment_id=%s velafi_order_id=%s current_status=%s incoming_status=%s",
+            "VelaFi webhook: skipping duplicate event for payment "
+            "payment_id=%s velafi_order_id=%s current_status=%s",
             payment.id,
             velafi_order_id,
             payment.status,
-            pay_status,
         )
         return {"callbackStatus": "SUCCESS"}
 
-    prev_pay_status = payment.status
     order = db.get(Order, payment.order_id)
     if not order:
         return {"callbackStatus": "FAIL"}
 
-    order_was_paid = order.status == OrderStatus.PAID
-    order_was_cancelled = order.status == OrderStatus.CANCELLED
+    _apply_state_transition(payment, order, internal_status, pay_status, db)
+    db.commit()
+    return {"callbackStatus": "SUCCESS"}
 
-    # ---- Valid state transitions ----
-    # Guards prevent duplicate / stale / out-of-order webhooks from
-    # corrupting inventory.  Only accept transitions that respect the
-    # order lifecycle (PENDING -> PAID, PENDING/PAID -> CANCELLED).
-    if (
-        internal_status == OrderStatus.PAID
-        and not order_was_paid
-        and not order_was_cancelled
-        and prev_pay_status != "paid"
-    ):
-        # PENDING -> PAID: commit reservation (take from available, clear reserved)
-        order.status = OrderStatus.PAID
-        payment.status = "paid"
-        for oi in order.items:
-            product = db.get(Product, oi.product_id)
-            if product:
-                product.quantity_available -= oi.qty
-                product.quantity_reserved -= oi.qty
 
-    elif (
-        internal_status == OrderStatus.CANCELLED
-        and not order_was_cancelled
-        and prev_pay_status != "failed"
-    ):
-        # PENDING -> CANCELLED: release reservation back to available
-        # PAID -> CANCELLED (refund): restore available inventory
-        order.status = OrderStatus.CANCELLED
-        payment.status = "failed"
-        for oi in order.items:
-            product = db.get(Product, oi.product_id)
-            if product:
-                if order_was_paid:
-                    product.quantity_available += oi.qty
-                else:
-                    product.quantity_reserved -= oi.qty
+@router.post("/webhook")
+async def webhook(request: Request, db: Session = Depends(get_db)):
+    """VelaFi push (backward compat alias for /webhook/velafi)."""
+    return await _handle_velafi_webhook(request, db)
 
-    elif internal_status == OrderStatus.PROCESSING:
-        # Intermediate processing status — no inventory side effect.
-        order.status = OrderStatus.PROCESSING
-        payment.status = "created"
 
+@router.post("/webhook/velafi")
+async def webhook_velafi(request: Request, db: Session = Depends(get_db)):
+    """VelaFi push (canonical endpoint)."""
+    return await _handle_velafi_webhook(request, db)
+
+
+# ---------------------------------------------------------------------------
+# Mono webhook handler
+# ---------------------------------------------------------------------------
+@router.post("/webhook/mono")
+async def webhook_mono(request: Request, db: Session = Depends(get_db)):
+    """Mono push — HMAC-verified webhook for PSE collection events.
+
+    Event types handled:
+      - ``collection_intent_credited`` -> Payment=paid, Order=paid
+      - All other events are acknowledged as SUCCESS without mutation.
+    """
+    raw = await request.body()
+    signature = request.headers.get("x-mono-signature", "")
+    client = MonoClient()
+    if not client.verify_webhook(raw, signature):
+        logger.warning("Mono webhook: bad signature")
+        return {"callbackStatus": "FAIL"}
+
+    try:
+        event = await request.json()
+    except Exception:
+        logger.warning("Mono webhook: invalid JSON body")
+        return {"callbackStatus": "FAIL"}
+
+    event_type = event.get("event", "")
+    data = event.get("data", {})
+    intent = data.get("intent", {})
+    reference = intent.get("reference", "")
+
+    # Map Mono event types to internal statuses
+    if event_type == "collection_intent_credited":
+        internal_status = OrderStatus.PAID
+        pay_status = "paid"
+    else:
+        # Unknown event — ack silently (no-op)
+        logger.info("Mono webhook: unhandled event_type=%s — acking as SUCCESS", event_type)
+        return {"callbackStatus": "SUCCESS"}
+
+    # Look up payment by reference (MD-{order}-{user})
+    payment = db.query(Payment).filter(Payment.reference == reference).first()
+    if not payment:
+        return {"callbackStatus": "SUCCESS"}
+
+    # Idempotency guard: skip if payment is already in the state this
+    # event would set (duplicate retry).
+    if payment.status == pay_status:
+        logger.info(
+            "Mono webhook: skipping duplicate event for payment "
+            "payment_id=%s reference=%s current_status=%s",
+            payment.id,
+            reference,
+            payment.status,
+        )
+        return {"callbackStatus": "SUCCESS"}
+
+    order = db.get(Order, payment.order_id)
+    if not order:
+        return {"callbackStatus": "FAIL"}
+
+    _apply_state_transition(payment, order, internal_status, pay_status, db)
+    db.commit()
+    return {"callbackStatus": "SUCCESS"}
