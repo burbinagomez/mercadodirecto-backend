@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
-    role: str  # "farmer" | "consumer"
+    role: str  # "farmer" | "consumer" | "restaurant"
 
 
 class LoginRequest(BaseModel):
