@@ -7,6 +7,8 @@ Flow:
   POST /payments/webhook   -> VelaFi pushes order status; verify RSA-SHA256
                               signature, then update Payment + Order status.
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -15,10 +17,17 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.order import Order
 from app.models.payment import Payment
+from app.models.product import Product
 from app.routers.auth import get_current_user
 from app.services import velafi as velafi_svc
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/payments", tags=["payments"])
+
+# Terminal payment statuses — once reached, a Payment will not be updated again
+# by a retried webhook event.
+_TERMINAL_PAYMENT_STATUSES = frozenset({"paid", "failed", "refunded"})
 
 
 class CheckoutBody(BaseModel):
@@ -109,12 +118,19 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     raw = await request.body()
     signature = request.headers.get("signature", "")
     if not velafi_svc.VelaFiClient.verify_webhook(raw, signature):
+        client_host = request.client.host if request.client else None
+        logger.warning(
+            "VelaFi webhook: bad signature client_host=%s signature_prefix=%s",
+            client_host,
+            signature[:20] if len(signature) > 20 else signature,
+        )
         return {"callbackStatus": "FAIL"}
 
     event = {}
     try:
         event = await request.json()
     except Exception:
+        logger.warning("VelaFi webhook: invalid JSON body")
         return {"callbackStatus": "FAIL"}
 
     velafi_order_id = str(event.get("orderId", ""))
@@ -128,10 +144,30 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
         internal_status, pay_status = "processing", "created"
 
     payment = db.query(Payment).filter(Payment.velafi_order_id == velafi_order_id).first()
-    if payment:
-        payment.status = pay_status
-        order = db.get(Order, payment.order_id)
-        if order:
-            order.status = internal_status
-        db.commit()
+    if not payment:
+        return {"callbackStatus": "SUCCESS"}
+
+    # Idempotency guard: skip if Payment is already in a terminal state.
+    if payment.status in _TERMINAL_PAYMENT_STATUSES:
+        logger.info(
+            "VelaFi webhook: skipping event for terminal payment "
+            "payment_id=%s velafi_order_id=%s current_status=%s incoming_status=%s",
+            payment.id,
+            velafi_order_id,
+            payment.status,
+            pay_status,
+        )
+        return {"callbackStatus": "SUCCESS"}
+
+    payment.status = pay_status
+    order = db.get(Order, payment.order_id)
+    if order:
+        order.status = internal_status
+        # Release quantity back to available on cancellation
+        if internal_status == "cancelled":
+            for item in order.items:
+                product = db.get(Product, item.product_id)
+                if product:
+                    product.quantity_available += item.qty
+    db.commit()
     return {"callbackStatus": "SUCCESS"}
