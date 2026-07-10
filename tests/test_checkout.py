@@ -14,37 +14,39 @@ class TestCheckoutHappyPath:
     """(a) Checkout creates an order, persists items, and reserves quantity."""
 
     def test_creates_order_with_correct_total(
-        self, client: TestClient, product: dict[str, Any], consumer_token: str
+        self, client: TestClient, sample_product: Product, consumer_token: str
     ) -> None:
         resp = client.post(
             "/orders",
-            json={"items": [{"product_id": product["id"], "qty": 3}]},
+            json={"items": [{"product_id": sample_product.id, "qty": 3}]},
             headers={"Authorization": f"Bearer {consumer_token}"},
         )
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["status"] == "pending"
-        assert data["total"] == 3 * 2500.0  # 3 kg × 2500
+        # sample_product has price_per_kg=5.0
+        assert data["total"] == 3 * 5.0
         assert len(data["items"]) == 1
         assert data["items"][0]["qty"] == 3
-        assert data["items"][0]["price"] == 7500.0
+        assert data["items"][0]["price"] == 15.0
 
     def test_reserves_quantity(
-        self, client: TestClient, db: Session, product: dict[str, Any], consumer_token: str
+        self, client: TestClient, session: Session, sample_product: Product, consumer_token: str
     ) -> None:
         client.post(
             "/orders",
-            json={"items": [{"product_id": product["id"], "qty": 10}]},
+            json={"items": [{"product_id": sample_product.id, "qty": 10}]},
             headers={"Authorization": f"Bearer {consumer_token}"},
         )
-        db.expire_all()
-        prod = db.get(Product, product["id"])
+        session.expire_all()
+        prod = session.get(Product, sample_product.id)
         assert prod is not None
-        # Starting qty_available was 100, reserved 10.
-        assert prod.quantity_available == 90
+        # Reservation model: available unchanged, reserved incremented
+        assert prod.quantity_available == 100
+        assert prod.quantity_reserved == 10
 
     def test_multiple_items_in_one_order(
-        self, client: TestClient, product: dict[str, Any], farmer_token: str, consumer_token: str
+        self, client: TestClient, sample_product: Product, farmer_token: str, consumer_token: str
     ) -> None:
         # Create a second product
         resp2 = client.post(
@@ -52,7 +54,7 @@ class TestCheckoutHappyPath:
             json={
                 "name": "Pera",
                 "category": "Frutas",
-                "price_per_kg": 1800.0,
+                "price_per_kg": 3.0,
                 "quantity_available": 50,
                 "department": "Cundinamarca",
             },
@@ -64,7 +66,7 @@ class TestCheckoutHappyPath:
             "/orders",
             json={
                 "items": [
-                    {"product_id": product["id"], "qty": 2},
+                    {"product_id": sample_product.id, "qty": 2},
                     {"product_id": prod2["id"], "qty": 5},
                 ]
             },
@@ -73,7 +75,7 @@ class TestCheckoutHappyPath:
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert len(data["items"]) == 2
-        expected_total = 2 * 2500.0 + 5 * 1800.0  # 5000 + 9000 = 14000
+        expected_total = 2 * 5.0 + 5 * 3.0  # 10 + 15 = 25
         assert data["total"] == expected_total
 
 
@@ -98,11 +100,11 @@ class TestCheckoutErrors:
         assert "Only consumers" in resp.text
 
     def test_insufficient_stock(
-        self, client: TestClient, product: dict[str, Any], consumer_token: str
+        self, client: TestClient, sample_product: Product, consumer_token: str
     ) -> None:
         resp = client.post(
             "/orders",
-            json={"items": [{"product_id": product["id"], "qty": 999}]},
+            json={"items": [{"product_id": sample_product.id, "qty": 999}]},
             headers={"Authorization": f"Bearer {consumer_token}"},
         )
         assert resp.status_code == 400
@@ -117,4 +119,4 @@ class TestCheckoutErrors:
             headers={"Authorization": f"Bearer {consumer_token}"},
         )
         assert resp.status_code == 400
-        assert "Unavailable" in resp.text
+        assert resp.json()["detail"] == "Product not found: 99999"

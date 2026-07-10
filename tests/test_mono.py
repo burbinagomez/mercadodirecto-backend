@@ -23,6 +23,7 @@ from app.models.payment import Payment, PaymentMethod
 from app.models.payout import FarmerBankAccount, FarmerPayout
 from app.models.product import Product
 from app.models.user import User
+from app.services.mono import MonoClient
 
 
 # ---------------------------------------------------------------------------
@@ -375,15 +376,16 @@ class TestWebhookMonoBadHMAC:
         order = _place_order(client, product["id"], qty=3, token=consumer_token)
         _seed_mono_payment(db, order["id"], consumer.id, mono_intent_id="int_badhmac")
 
-        # No MONO_WEBHOOK_SECRET configured in test env — verify will fail
-        _raw, headers = _mono_webhook_payload(
-            "collection_intent_credited",
-            {"id": "int_badhmac", "reference": f"MD-{order['id']}-{consumer.id}"},
-            signature="totally-fake-signature",
-        )
-        resp = client.post("/payments/webhook/mono", content=_raw, headers=headers)
-        assert resp.status_code == 200, resp.text
-        assert resp.json() == {"callbackStatus": "FAIL"}
+        # Override the global conftest mock — force verify to fail.
+        with patch.object(MonoClient, "verify_webhook", return_value=False):
+            _raw, headers = _mono_webhook_payload(
+                "collection_intent_credited",
+                {"id": "int_badhmac", "reference": f"MD-{order['id']}-{consumer.id}"},
+                signature="totally-fake-signature",
+            )
+            resp = client.post("/payments/webhook/mono", content=_raw, headers=headers)
+            assert resp.status_code == 200, resp.text
+            assert resp.json() == {"callbackStatus": "FAIL"}
 
         # State unchanged
         db.expire_all()

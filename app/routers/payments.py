@@ -4,6 +4,7 @@ Flow:
   POST /payments/checkout   method=mono     -> Mono PSE collection intent, return redirectUrl
                             method=stablecoin -> VelaFi stablecoin payment link
   POST /payments/webhook          -> VelaFi order-status webhook (RSA-SHA256)
+  POST /payments/webhook/velafi   -> VelaFi order-status webhook (RSA-SHA256)
   POST /payments/webhook/mono     -> Mono Banking webhook (HMAC-SHA256)
 """
 
@@ -30,8 +31,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-# Terminal payment statuses — once reached, a Payment will not be updated again
-# by a retried webhook event.
+# Terminal payment statuses — once reached, a Payment is considered
+# final.  The idempotency guard below prevents duplicate events from
+# re-processing while still allowing legitimate cross-status
+# transitions (e.g. PAID -> CANCELLED refund).
 _TERMINAL_PAYMENT_STATUSES = frozenset({"paid", "failed", "refunded"})
 
 
@@ -42,7 +45,7 @@ class CheckoutBody(BaseModel):
     wallet_id: int | None = None
     currency: str = "USDT"
     # mono (PSE) fields
-    redirect_url: str | None = None  # where Mono redirects the user after bank auth
+    redirect_url: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +128,70 @@ def checkout(
 
 
 # ---------------------------------------------------------------------------
-# POST /payments/webhook  (VelaFi)
+# Shared state-transition logic for both VelaFi and Mono webhooks
 # ---------------------------------------------------------------------------
 
 
-@router.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)):
+def _apply_state_transition(
+    payment: Payment,
+    order: Order,
+    internal_status: str,
+    pay_status: str,
+    db: Session,
+) -> None:
+    """Apply the valid state transition, mutating *payment* and *order*
+    in-place.  Caller is responsible for ``db.commit()`` after this.
+
+    Raises nothing — if no transition matches the current state, the
+    function is a no-op (the webhook ack's SUCCESS either way).
+    """
+    prev_pay_status = payment.status
+    order_was_paid = order.status == OrderStatus.PAID
+    order_was_cancelled = order.status == OrderStatus.CANCELLED
+
+    # PENDING -> PAID: commit reservation
+    if (
+        internal_status == OrderStatus.PAID
+        and not order_was_paid
+        and not order_was_cancelled
+        and prev_pay_status != "paid"
+    ):
+        order.status = OrderStatus.PAID
+        payment.status = "paid"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                product.quantity_available -= oi.qty
+                product.quantity_reserved -= oi.qty
+
+    # PENDING/PAID -> CANCELLED: release reservation (or refund)
+    elif (
+        internal_status == OrderStatus.CANCELLED
+        and not order_was_cancelled
+        and prev_pay_status != "failed"
+    ):
+        order.status = OrderStatus.CANCELLED
+        payment.status = "failed"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                if order_was_paid:
+                    product.quantity_available += oi.qty
+                else:
+                    product.quantity_reserved -= oi.qty
+
+    # Intermediate processing status — no inventory side effect.
+    elif internal_status == OrderStatus.PROCESSING:
+        order.status = OrderStatus.PROCESSING
+        payment.status = "created"
+
+
+# ---------------------------------------------------------------------------
+# VelaFi webhook handler (shared by /webhook and /webhook/velafi)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_velafi_webhook(request: Request, db: Session) -> dict[str, str]:
     raw = await request.body()
     signature = request.headers.get("signature", "")
     from app.services.velafi import VelaFiClient
@@ -163,16 +224,72 @@ def _process_velafi_webhook(
     """VelaFi webhook logic — map status and apply transition."""
     if status_code in ("50", "60"):
         internal_status = OrderStatus.PAID
+        pay_status = "paid"
     elif status_code in ("70", "71", "72"):
         internal_status = OrderStatus.CANCELLED
+        pay_status = "failed"
     else:
         internal_status = OrderStatus.PROCESSING
+        pay_status = "created"
 
     payment = db.query(Payment).filter(Payment.velafi_order_id == velafi_order_id).first()
     if not payment:
         return {"callbackStatus": "SUCCESS"}
 
-    return _apply_status_transition(payment, internal_status, db)
+    return _apply_status_transition(payment, internal_status, pay_status, db)
+
+
+# ---------------------------------------------------------------------------
+# POST /payments/webhook  (VelaFi — backward compat)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webhook")
+async def webhook(request: Request, db: Session = Depends(get_db)):
+    """VelaFi push (backward compat alias for /webhook/velafi)."""
+    return await _handle_velafi_webhook(request, db)
+
+
+@router.post("/webhook/velafi")
+async def webhook_velafi(request: Request, db: Session = Depends(get_db)):
+    """VelaFi push (canonical endpoint)."""
+    return await _handle_velafi_webhook(request, db)
+
+
+# ---------------------------------------------------------------------------
+# Shared status transition wrapper (idempotency guard + state transition)
+# ---------------------------------------------------------------------------
+
+
+def _apply_status_transition(
+    payment: Payment,
+    internal_status: str,
+    pay_status: str,
+    db: Session,
+) -> dict[str, str]:
+    """Apply a valid status transition with terminal-state idempotency guard.
+
+    Returns SUCCESS if the payment is already in a terminal state (no-op),
+    or after applying the transition. Returns FAIL if the order is missing.
+    """
+    # Idempotency guard: skip if Payment is already in a terminal state.
+    if payment.status in _TERMINAL_PAYMENT_STATUSES:
+        logger.info(
+            "Webhook: skipping event for terminal payment "
+            "payment_id=%s current_status=%s incoming_status=%s",
+            payment.id,
+            payment.status,
+            internal_status,
+        )
+        return {"callbackStatus": "SUCCESS"}
+
+    order = db.get(Order, payment.order_id)
+    if not order:
+        return {"callbackStatus": "FAIL"}
+
+    _apply_state_transition(payment, order, internal_status, pay_status, db)
+    db.commit()
+    return {"callbackStatus": "SUCCESS"}
 
 
 # ---------------------------------------------------------------------------
@@ -415,74 +532,3 @@ def _check_order_completion(order_id: int, db: Session) -> None:
         order = db.get(Order, order_id)
         if order and order.status == OrderStatus.PAID:
             order.status = OrderStatus.PROCESSING  # "completed" in a future state machine
-
-
-# ---------------------------------------------------------------------------
-# Shared status transition logic (used by both VelaFi and Mono webhooks)
-# ---------------------------------------------------------------------------
-
-
-def _apply_status_transition(
-    payment: Payment,
-    internal_status: str,
-    db: Session,
-) -> dict[str, str]:
-    """Apply a valid status transition or return FAIL.
-
-    Shared between VelaFi and Mono webhook handlers.
-    """
-    # Idempotency guard: skip if Payment is already in a terminal state.
-    if payment.status in _TERMINAL_PAYMENT_STATUSES:
-        logger.info(
-            "Webhook: skipping event for terminal payment "
-            "payment_id=%s current_status=%s incoming_status=%s",
-            payment.id,
-            payment.status,
-            internal_status,
-        )
-        return {"callbackStatus": "SUCCESS"}
-
-    prev_pay_status = payment.status
-    order = db.get(Order, payment.order_id)
-    if not order:
-        return {"callbackStatus": "FAIL"}
-
-    order_was_paid = order.status == OrderStatus.PAID
-    order_was_cancelled = order.status == OrderStatus.CANCELLED
-
-    # ---- Valid state transitions ----
-    if (
-        internal_status == OrderStatus.PAID
-        and not order_was_paid
-        and not order_was_cancelled
-        and prev_pay_status != "paid"
-    ):
-        order.status = OrderStatus.PAID
-        payment.status = "paid"
-        for oi in order.items:
-            product = db.get(Product, oi.product_id)
-            if product:
-                product.quantity_available -= oi.qty
-                product.quantity_reserved -= oi.qty
-
-    elif (
-        internal_status == OrderStatus.CANCELLED
-        and not order_was_cancelled
-        and prev_pay_status != "failed"
-    ):
-        order.status = OrderStatus.CANCELLED
-        payment.status = "failed"
-        for oi in order.items:
-            product = db.get(Product, oi.product_id)
-            if product:
-                if order_was_paid:
-                    product.quantity_available += oi.qty
-                else:
-                    product.quantity_reserved -= oi.qty
-
-    elif internal_status == OrderStatus.PROCESSING:
-        order.status = OrderStatus.PROCESSING
-        payment.status = "created"
-
-    db.commit()
-    return {"callbackStatus": "SUCCESS"}

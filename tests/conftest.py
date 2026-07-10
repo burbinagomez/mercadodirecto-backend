@@ -25,12 +25,16 @@ from app.models.payment import PaymentMethod
 from app.models.payout import FarmerBankAccount
 from app.models.product import Product
 from app.models.user import User
+from app.services.mono import MonoClient
 from app.services.velafi import VelaFiClient
 
 
 # Monkey-patch webhook signature verification for tests — always accept.
-_patcher = patch.object(VelaFiClient, "verify_webhook", return_value=True)
-_patcher.start()
+_patcher_velafi = patch.object(VelaFiClient, "verify_webhook", return_value=True)
+_patcher_velafi.start()
+
+_patcher_mono = patch.object(MonoClient, "verify_webhook", return_value=True)
+_patcher_mono.start()
 
 
 @pytest.fixture(scope="function")
@@ -99,19 +103,23 @@ def client(session) -> Generator[TestClient, Any, Any]:
 
 @pytest.fixture()
 def farmer_token(session) -> str:
-    """Create + return a farmer user's JWT."""
-    user = User(email="farmer@test.com", role="farmer", password_hash="x")
-    session.add(user)
-    session.flush()
+    """Create + return a farmer user's JWT (idempotent by email)."""
+    user = session.query(User).filter(User.email == "farmer@test.com").first()
+    if not user:
+        user = User(email="farmer@test.com", role="farmer", password_hash="x")
+        session.add(user)
+        session.flush()
     return create_access_token(subject=user.id, role="farmer")
 
 
 @pytest.fixture()
 def consumer_token(session) -> str:
-    """Create + return a consumer user's JWT."""
-    user = User(email="consumer@test.com", role="consumer", password_hash="x")
-    session.add(user)
-    session.flush()
+    """Create + return a consumer user's JWT (idempotent by email)."""
+    user = session.query(User).filter(User.email == "consumer@test.com").first()
+    if not user:
+        user = User(email="consumer@test.com", role="consumer", password_hash="x")
+        session.add(user)
+        session.flush()
     return create_access_token(subject=user.id, role="consumer")
 
 
@@ -121,15 +129,34 @@ def headers_farmer(farmer_token) -> dict[str, str]:
 
 
 @pytest.fixture()
+def consumer(session) -> User:
+    """Create and return a consumer user (idempotent by email)."""
+    usr = session.query(User).filter(User.email == "consumer@test.com").first()
+    if not usr:
+        usr = User(email="consumer@test.com", role="consumer", password_hash="x")
+        session.add(usr)
+        session.flush()
+    return usr
+
+
+@pytest.fixture()
 def headers_consumer(consumer_token) -> dict[str, str]:
     return {"Authorization": f"Bearer {consumer_token}"}
 
 
 @pytest.fixture()
 def sample_product(session) -> Product:
-    """A product with 100 kg available, 0 reserved."""
+    """A product with 100 kg available, 0 reserved.
+
+    Creates a farmer user (id=1) first so the FK constraint is satisfied.
+    """
+    farmer = session.query(User).filter(User.email == "farmer@test.com").first()
+    if not farmer:
+        farmer = User(email="farmer@test.com", role="farmer", password_hash="x")
+        session.add(farmer)
+        session.flush()
     p = Product(
-        farmer_id=1,
+        farmer_id=farmer.id,
         name="Test Tomato",
         category="vegetables",
         price_per_kg=5.0,
@@ -160,16 +187,18 @@ def product(client: TestClient, farmer_token: str) -> dict[str, Any]:
     return resp.json()
 
 
-@pytest.fixture()
-def consumer(session) -> User:
-    """Return the existing consumer user created by consumer_token."""
-    return session.query(User).filter(User.role == "consumer").first()
+
 
 
 @pytest.fixture()
 def farmer(session) -> User:
-    """Return the existing farmer user created by farmer_token."""
-    return session.query(User).filter(User.role == "farmer").first()
+    """Return the existing farmer user created by farmer_token (idempotent by email)."""
+    usr = session.query(User).filter(User.email == "farmer@test.com").first()
+    if not usr:
+        usr = User(email="farmer@test.com", role="farmer", password_hash="x")
+        session.add(usr)
+        session.flush()
+    return usr
 
 
 @pytest.fixture()
