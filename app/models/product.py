@@ -17,6 +17,7 @@ class Product(Base):
     price_per_kg: Mapped[float] = mapped_column(Float)
     unit: Mapped[str] = mapped_column(String(20), default="kg")
     quantity_available: Mapped[int] = mapped_column(Integer, default=0)
+    quantity_reserved: Mapped[int] = mapped_column(Integer, default=0)
     harvest_date: Mapped[str] = mapped_column(Date, nullable=True)
     image_urls: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     department: Mapped[str] = mapped_column(String(100), index=True, default="")

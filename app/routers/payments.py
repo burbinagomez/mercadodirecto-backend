@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.order import Order
+from app.models.order import Order, OrderItem, OrderStatus
 from app.models.payment import Payment
 from app.models.product import Product
 from app.routers.auth import get_current_user
@@ -137,11 +137,11 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     status_code = str(event.get("orderStatus", ""))
     # Map VelaFi status -> internal
     if status_code in ("50", "60"):
-        internal_status, pay_status = "paid", "paid"
+        internal_status = OrderStatus.PAID
     elif status_code in ("70", "71", "72"):
-        internal_status, pay_status = "cancelled", "failed"
+        internal_status = OrderStatus.CANCELLED
     else:
-        internal_status, pay_status = "processing", "created"
+        internal_status = OrderStatus.PROCESSING
 
     payment = db.query(Payment).filter(Payment.velafi_order_id == velafi_order_id).first()
     if not payment:
@@ -159,15 +159,52 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
         )
         return {"callbackStatus": "SUCCESS"}
 
-    payment.status = pay_status
+    prev_pay_status = payment.status
     order = db.get(Order, payment.order_id)
-    if order:
-        order.status = internal_status
-        # Release quantity back to available on cancellation
-        if internal_status == "cancelled":
-            for item in order.items:
-                product = db.get(Product, item.product_id)
-                if product:
-                    product.quantity_available += item.qty
-    db.commit()
-    return {"callbackStatus": "SUCCESS"}
+    if not order:
+        return {"callbackStatus": "FAIL"}
+
+    order_was_paid = order.status == OrderStatus.PAID
+    order_was_cancelled = order.status == OrderStatus.CANCELLED
+
+    # ---- Valid state transitions ----
+    # Guards prevent duplicate / stale / out-of-order webhooks from
+    # corrupting inventory.  Only accept transitions that respect the
+    # order lifecycle (PENDING -> PAID, PENDING/PAID -> CANCELLED).
+    if (
+        internal_status == OrderStatus.PAID
+        and not order_was_paid
+        and not order_was_cancelled
+        and prev_pay_status != "paid"
+    ):
+        # PENDING -> PAID: commit reservation (take from available, clear reserved)
+        order.status = OrderStatus.PAID
+        payment.status = "paid"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                product.quantity_available -= oi.qty
+                product.quantity_reserved -= oi.qty
+
+    elif (
+        internal_status == OrderStatus.CANCELLED
+        and not order_was_cancelled
+        and prev_pay_status != "failed"
+    ):
+        # PENDING -> CANCELLED: release reservation back to available
+        # PAID -> CANCELLED (refund): restore available inventory
+        order.status = OrderStatus.CANCELLED
+        payment.status = "failed"
+        for oi in order.items:
+            product = db.get(Product, oi.product_id)
+            if product:
+                if order_was_paid:
+                    product.quantity_available += oi.qty
+                else:
+                    product.quantity_reserved -= oi.qty
+
+    elif internal_status == OrderStatus.PROCESSING:
+        # Intermediate processing status — no inventory side effect.
+        order.status = OrderStatus.PROCESSING
+        payment.status = "created"
+

@@ -10,6 +10,7 @@ class ProductIn(BaseModel):
     price_per_kg: float
     unit: str = "kg"
     quantity_available: int = 0
+    quantity_reserved: int = 0
     harvest_date: Optional[str] = None
     image_urls: list[str] = []
     department: str = ""
@@ -23,6 +24,7 @@ class ProductOut(BaseModel):
     price_per_kg: float
     unit: str
     quantity_available: int
+    quantity_reserved: int
     harvest_date: Optional[str]
     image_urls: list[str]
     department: str

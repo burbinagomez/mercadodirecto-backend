@@ -1,9 +1,12 @@
-"""Shared test fixtures — in-memory SQLite, TestClient, auth helpers."""
+"""Shared test fixtures — SQLite temp file with seeded users + products."""
 
 import os
+import tempfile
 
-# Point the app at a test SQLite database *before* any app imports.
-os.environ["DATABASE_URL"] = "sqlite:///./test.db"
+# Force SQLite in-memory BEFORE any app module is imported.
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+os.environ.setdefault("JWT_SECRET", "test-secret")
+os.environ.setdefault("CORS_ORIGINS", "*")
 
 from collections.abc import Generator
 from typing import Any
@@ -12,137 +15,120 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
-# At this point app.main is imported, which calls
-# Base.metadata.create_all(bind=engine) on test.db (fine — it's a one-shot call).
+from unittest.mock import patch
+
 from app.core.database import Base, get_db
-from app.main import app  # noqa: F401 — ensure routers are registered
-from app.models.user import User
+from app.core.security import create_access_token
+from app.main import app
 from app.models.product import Product
-from app.core.security import hash_password, create_access_token
-
-# ---------------------------------------------------------------------------
-# Test database — file-based SQLite for compatibility across TestClient threads.
-# ---------------------------------------------------------------------------
-TEST_DB_URL = "sqlite:///./test.db"
-test_engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
+from app.models.user import User
+from app.services.velafi import VelaFiClient
 
 
-@event.listens_for(test_engine, "connect")
-def _enable_fk(dbapi_connection: Any, _connection_record: Any) -> None:
-    """SQLite needs explicit PRAGMA to enforce foreign keys."""
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+# Monkey-patch webhook signature verification for tests — always accept.
+_patcher = patch.object(VelaFiClient, "verify_webhook", return_value=True)
+_patcher.start()
 
 
-TestingSessionLocal = sessionmaker(
-    bind=test_engine, autoflush=False, autocommit=False
-)
+@pytest.fixture(scope="function")
+def db_path():
+    """Temp file path for an isolated per-test SQLite database."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        yield f.name
+    os.unlink(f.name)
 
 
-# ---------------------------------------------------------------------------
-# Per-test lifecycle
-# ---------------------------------------------------------------------------
-@pytest.fixture(autouse=True)
-def setup_db() -> Generator[None, None, None]:
-    """Create all tables before each test, drop them after."""
-    Base.metadata.create_all(bind=test_engine)
-    yield
-    Base.metadata.drop_all(bind=test_engine)
+@pytest.fixture(scope="function")
+def engine(db_path):
+    """Function-scoped SQLite engine backed by a temp file."""
+    e = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    # Enable foreign keys
+    @event.listens_for(e, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(bind=e)
+    yield e
+    e.dispose()
 
 
-@pytest.fixture
-def db() -> Generator[Session, None, None]:
-    """Provide a fresh DB session wired to the test engine."""
-    session = TestingSessionLocal()
-    try:
+@pytest.fixture()
+def session(engine) -> Generator[Session, Any, Any]:
+    """Transaction-per-test session with rollback.
+
+    Uses a SAVEPOINT so that ``session.commit()`` inside the router
+    only commits the savepoint, not the outer transaction.  At teardown
+    the outer transaction is rolled back, discarding all test data.
+    """
+    connection = engine.connect()
+    transaction = connection.begin()
+    SessionLocal = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
+    session = SessionLocal()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture()
+def client(session) -> Generator[TestClient, Any, Any]:
+    """FastAPI TestClient with overridden get_db."""
+
+    def _override():
         yield session
-    finally:
-        # Close session and ensure the underlying connection is returned/recycled
-        session.close()
-        test_engine.dispose()
 
-
-@pytest.fixture
-def client(db: Session) -> Generator[TestClient, None, None]:
-    """FastAPI TestClient with the test DB session as the dependency."""
-
-    def _inner() -> Generator[Session, None, None]:
-        yield db
-
-    app.dependency_overrides.clear()
-    app.dependency_overrides[get_db] = _inner
+    app.dependency_overrides[get_db] = _override
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
 
 
-# ---------------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------------
-def _create_user(
-    db: Session,
-    email: str = "consumer@test.com",
-    password: str = "pass123",
-    role: str = "consumer",
-) -> User:
-    user = User(
-        email=email,
-        password_hash=hash_password(password),
-        role=role,
+@pytest.fixture()
+def farmer_token(session) -> str:
+    """Create + return a farmer user's JWT."""
+    user = User(email="farmer@test.com", role="farmer", password_hash="x")
+    session.add(user)
+    session.flush()
+    return create_access_token(subject=user.id, role="farmer")
+
+
+@pytest.fixture()
+def consumer_token(session) -> str:
+    """Create + return a consumer user's JWT."""
+    user = User(email="consumer@test.com", role="consumer", password_hash="x")
+    session.add(user)
+    session.flush()
+    return create_access_token(subject=user.id, role="consumer")
+
+
+@pytest.fixture()
+def headers_farmer(farmer_token) -> dict[str, str]:
+    return {"Authorization": f"Bearer {farmer_token}"}
+
+
+@pytest.fixture()
+def headers_consumer(consumer_token) -> dict[str, str]:
+    return {"Authorization": f"Bearer {consumer_token}"}
+
+
+@pytest.fixture()
+def sample_product(session) -> Product:
+    """A product with 100 kg available, 0 reserved."""
+    p = Product(
+        farmer_id=1,
+        name="Test Tomato",
+        category="vegetables",
+        price_per_kg=5.0,
+        quantity_available=100,
+        quantity_reserved=0,
+        department="TestDept",
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-def _token_for(user: User) -> str:
-    return create_access_token(user.id, user.role)
-
-
-@pytest.fixture
-def consumer(db: Session) -> User:
-    """Create and return a consumer user."""
-    return _create_user(db, email="consumer@test.com", role="consumer")
-
-
-@pytest.fixture
-def consumer_token(consumer: User) -> str:
-    """Return a valid auth token for the consumer fixture."""
-    return _token_for(consumer)
-
-
-@pytest.fixture
-def farmer(db: Session) -> User:
-    """Create and return a farmer user."""
-    return _create_user(db, email="farmer@test.com", role="farmer")
-
-
-@pytest.fixture
-def farmer_token(farmer: User) -> str:
-    """Return a valid auth token for the farmer fixture."""
-    return _token_for(farmer)
-
-
-# ---------------------------------------------------------------------------
-# Product fixture — created by the default farmer
-# ---------------------------------------------------------------------------
-@pytest.fixture
-def product(client: TestClient, farmer_token: str) -> dict[str, Any]:
-    """Create a product via the API and return the response JSON."""
-    resp = client.post(
-        "/products",
-        json={
-            "name": "Manzana",
-            "category": "Frutas",
-            "price_per_kg": 2500.0,
-            "quantity_available": 100,
-            "department": "Antioquia",
-        },
-        headers={"Authorization": f"Bearer {farmer_token}"},
-    )
-    assert resp.status_code == 200, resp.text
-    return resp.json()
+    session.add(p)
+    session.flush()
+    return p
