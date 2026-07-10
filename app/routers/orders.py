@@ -17,8 +17,8 @@ def checkout(
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if current.role != "consumer":
-        raise HTTPException(status_code=403, detail="Only consumers can order")
+    if current.role not in ("consumer", "restaurant"):
+        raise HTTPException(status_code=403, detail="Only consumers and restaurants can order")
     total = 0.0
     order = Order(consumer_id=current.id, status="pending", total=0.0)
     db.add(order)

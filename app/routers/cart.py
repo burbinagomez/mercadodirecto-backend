@@ -11,15 +11,15 @@ from app.schemas.order import CartItemIn
 router = APIRouter(prefix="/cart", tags=["cart"])
 
 
-def _require_consumer(current):
-    if current.role != "consumer":
-        raise HTTPException(status_code=403, detail="Only consumers have a cart")
+def _require_buyer(current):
+    if current.role not in ("consumer", "restaurant"):
+        raise HTTPException(status_code=403, detail="Only consumers and restaurants have a cart")
     return current
 
 
 @router.get("")
 def view_cart(current=Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_consumer(current)
+    _require_buyer(current)
     rows = db.query(CartItem).filter(CartItem.consumer_id == current.id).all()
     items, total = [], 0.0
     for row in rows:
@@ -44,7 +44,7 @@ def add_to_cart(
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_consumer(current)
+    _require_buyer(current)
     product = db.get(Product, payload.product_id)
     if not product or product.quantity_available < payload.qty:
         raise HTTPException(status_code=400, detail=f"Unavailable: {payload.product_id}")
@@ -68,7 +68,7 @@ def update_cart_item(
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_consumer(current)
+    _require_buyer(current)
     item = (
         db.query(CartItem)
         .filter(CartItem.consumer_id == current.id, CartItem.product_id == product_id)
@@ -90,7 +90,7 @@ def remove_cart_item(
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_consumer(current)
+    _require_buyer(current)
     db.query(CartItem).filter(
         CartItem.consumer_id == current.id, CartItem.product_id == product_id
     ).delete()
@@ -104,7 +104,7 @@ def validate_cart(
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_consumer(current)
+    _require_buyer(current)
     total = 0.0
     for item in items:
         product = db.get(Product, item.product_id)

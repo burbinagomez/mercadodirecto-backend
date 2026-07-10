@@ -31,8 +31,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == payload.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
-    if payload.role not in ("farmer", "consumer"):
-        raise HTTPException(status_code=400, detail="role must be farmer|consumer")
+    if payload.role not in ("farmer", "consumer", "restaurant"):
+        raise HTTPException(status_code=400, detail="role must be farmer|consumer|restaurant")
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
