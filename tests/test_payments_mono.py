@@ -8,6 +8,7 @@ Coverage (per test plan):
   (e) webhook /mono bad HMAC -> 401 / FAIL, no status change
   (f) payout bank_transfer_approved -> FarmerPayout=pending->paid
   (g) payout bank_transfer_declined -> FarmerPayout=pending->failed
+  (h) webhook /velafi terminal guard -> duplicate terminal event is no-op (CRITICAL)
 """
 
 import json
@@ -24,6 +25,7 @@ from app.models.payout import FarmerBankAccount, FarmerPayout
 from app.models.product import Product
 from app.models.user import User
 from app.services.mono import MonoClient
+from app.services.velafi import VelaFiClient
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,40 @@ def _seed_mono_payment(
     db.commit()
     db.refresh(pmt)
     return pmt
+
+
+def _seed_velafi_payment(
+    db: Session,
+    order_id: int,
+    consumer_id: int,
+    velafi_order_id: str = "vela_guard_001",
+    status: str = "created",
+) -> Payment:
+    pmt = Payment(
+        order_id=order_id,
+        consumer_id=consumer_id,
+        method=PaymentMethod.STABLECOIN.value,
+        status=status,
+        amount=100.0,
+        currency="USDT",
+        velafi_order_id=velafi_order_id,
+        reference=f"MD-{order_id}-{consumer_id}",
+    )
+    db.add(pmt)
+    db.commit()
+    db.refresh(pmt)
+    return pmt
+
+
+def _velafi_webhook_payload(
+    velafi_order_id: str = "vela_guard_001",
+    status_code: str = "60",
+    signature: str = "deadbeef",
+) -> tuple[bytes, dict[str, str]]:
+    body = {"orderId": velafi_order_id, "orderStatus": status_code}
+    raw = json.dumps(body).encode()
+    headers = {"signature": signature, "Content-Type": "application/json"}
+    return raw, headers
 
 
 def _mono_webhook_payload(
@@ -547,3 +583,106 @@ class TestWebhookMonoTransferDeclined:
             .first()
         )
         assert payout.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# VelaFi terminal-state idempotency guard (CRITICAL)
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookVelafiTerminalGuard:
+    """(h) VelaFi /webhook terminal-state guard — duplicate events are no-ops."""
+
+    def test_duplicate_velafi_paid_event_is_noop(
+        self,
+        client: TestClient,
+        db: Session,
+        product: dict[str, Any],
+        consumer_token: str,
+        consumer: User,
+    ) -> None:
+        """Same status=60 twice — second is idempotent no-op."""
+        order = _place_order(client, product["id"], qty=5, token=consumer_token)
+        _seed_velafi_payment(db, order["id"], consumer.id, velafi_order_id="vela_guard_60")
+
+        _raw, headers = _velafi_webhook_payload("vela_guard_60", "60")
+
+        # First: 60 → paid
+        resp1 = client.post("/payments/webhook", content=_raw, headers=headers)
+        assert resp1.status_code == 200, resp1.text
+        assert resp1.json() == {"callbackStatus": "SUCCESS"}
+
+        db.expire_all()
+        payment = db.query(Payment).filter(Payment.velafi_order_id == "vela_guard_60").first()
+        assert payment is not None
+        assert payment.status == "paid"
+
+        # Second (duplicate): same status 60 → no-op
+        resp2 = client.post("/payments/webhook", content=_raw, headers=headers)
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json() == {"callbackStatus": "SUCCESS"}
+
+        db.expire_all()
+        payment2 = db.query(Payment).filter(Payment.velafi_order_id == "vela_guard_60").first()
+        assert payment2.status == "paid"
+
+    def test_duplicate_velafi_cancelled_event_is_noop(
+        self,
+        client: TestClient,
+        db: Session,
+        product: dict[str, Any],
+        consumer_token: str,
+        consumer: User,
+    ) -> None:
+        """Same status=72 twice — second is idempotent no-op."""
+        order = _place_order(client, product["id"], qty=5, token=consumer_token)
+        _seed_velafi_payment(db, order["id"], consumer.id, velafi_order_id="vela_guard_72")
+
+        _raw, headers = _velafi_webhook_payload("vela_guard_72", "72")
+
+        # First: 72 → cancelled
+        resp1 = client.post("/payments/webhook", content=_raw, headers=headers)
+        assert resp1.status_code == 200, resp1.text
+
+        db.expire_all()
+        payment = db.query(Payment).filter(Payment.velafi_order_id == "vela_guard_72").first()
+        assert payment is not None
+        assert payment.status == "failed"
+
+        # Second (duplicate): same status 72 → no-op
+        resp2 = client.post("/payments/webhook", content=_raw, headers=headers)
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json() == {"callbackStatus": "SUCCESS"}
+
+        db.expire_all()
+        payment2 = db.query(Payment).filter(Payment.velafi_order_id == "vela_guard_72").first()
+        assert payment2.status == "failed"
+
+    def test_velafi_canonical_terminal_guard(
+        self,
+        client: TestClient,
+        db: Session,
+        product: dict[str, Any],
+        consumer_token: str,
+        consumer: User,
+    ) -> None:
+        """Canonical /webhook/velafi also guards against duplicates."""
+        order = _place_order(client, product["id"], qty=5, token=consumer_token)
+        _seed_velafi_payment(db, order["id"], consumer.id, velafi_order_id="vela_canon_guard")
+
+        _raw, headers = _velafi_webhook_payload("vela_canon_guard", "60")
+
+        # First call
+        resp1 = client.post("/payments/webhook/velafi", content=_raw, headers=headers)
+        assert resp1.status_code == 200, resp1.text
+        assert resp1.json() == {"callbackStatus": "SUCCESS"}
+
+        # Duplicate — should no-op
+        resp2 = client.post("/payments/webhook/velafi", content=_raw, headers=headers)
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json() == {"callbackStatus": "SUCCESS"}
+
+        db.expire_all()
+        payment = db.query(Payment).filter(Payment.velafi_order_id == "vela_canon_guard").first()
+        assert payment is not None
+        assert payment.status == "paid"
