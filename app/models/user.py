@@ -1,5 +1,7 @@
 """User + role profile models."""
-from sqlalchemy import String, Enum as SAEnum, ForeignKey, Text
+from datetime import datetime
+
+from sqlalchemy import String, Enum as SAEnum, ForeignKey, Text, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -12,7 +14,9 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(SAEnum("farmer", "consumer", name="user_role"))
-    created_at: Mapped[str] = mapped_column(Text, default="now()")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=datetime.utcnow
+    )
 
     farmer_profile: Mapped["FarmerProfile"] = relationship(
         back_populates="user", uselist=False, cascade="all, delete-orphan"

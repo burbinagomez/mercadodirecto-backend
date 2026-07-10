@@ -1,5 +1,7 @@
 """Product listing model."""
-from sqlalchemy import String, Float, Integer, ForeignKey, Text, Date
+from datetime import datetime
+
+from sqlalchemy import String, Float, Integer, ForeignKey, Text, Date, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,4 +20,6 @@ class Product(Base):
     harvest_date: Mapped[str] = mapped_column(Date, nullable=True)
     image_urls: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     department: Mapped[str] = mapped_column(String(100), index=True, default="")
-    created_at: Mapped[str] = mapped_column(Text, default="now()")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=datetime.utcnow
+    )
