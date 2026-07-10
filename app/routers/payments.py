@@ -379,14 +379,14 @@ def _handle_mono_collection_credited(data: dict[str, Any], db: Session) -> dict[
     db.flush()
 
     # --- Create farmer payouts + trigger transfers ---
-    _create_farmer_payouts(order, db)
+    _create_farmer_payouts(order, payment, db)
 
     db.commit()
     logger.info("Mono webhook: order %s paid via intent %s", order.id, intent_id)
     return {"callbackStatus": "SUCCESS"}
 
 
-def _create_farmer_payouts(order: Order, db: Session) -> None:
+def _create_farmer_payouts(order: Order, payment: Payment, db: Session) -> None:
     """Create pending FarmerPayout rows and call Mono create_transfer for each farmer."""
     farmer_totals: dict[int, float] = {}
     for oi in order.items:
@@ -412,6 +412,7 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
                 order.id,
             )
             payout = FarmerPayout(
+                payment_id=payment.id,
                 order_id=order.id,
                 farmer_id=farmer_id,
                 amount=amount,
@@ -433,6 +434,7 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
             )
             transfer_id = transfer_result.get("transfer_id", transfer_result.get("id", ""))
             payout = FarmerPayout(
+                payment_id=payment.id,
                 order_id=order.id,
                 farmer_id=farmer_id,
                 amount=amount,
@@ -449,6 +451,7 @@ def _create_farmer_payouts(order: Order, db: Session) -> None:
                 exc,
             )
             payout = FarmerPayout(
+                payment_id=payment.id,
                 order_id=order.id,
                 farmer_id=farmer_id,
                 amount=amount,
