@@ -1,5 +1,7 @@
 """Order + order item models."""
-from sqlalchemy import String, Float, Integer, ForeignKey, Text
+from datetime import datetime
+
+from sqlalchemy import String, Float, Integer, ForeignKey, Text, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -12,7 +14,9 @@ class Order(Base):
     consumer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     total: Mapped[float] = mapped_column(Float, default=0.0)
-    created_at: Mapped[str] = mapped_column(Text, default="now()")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=datetime.utcnow
+    )
 
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan"
